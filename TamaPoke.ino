@@ -2076,9 +2076,11 @@ void drawEvolveButton() {
   gfx->drawRoundRect(x, y, w, h, 18, UI_WHITE);
   gfx->drawRoundRect(x + 2, y + 2, w - 4, h - 4, 16, UI_WHITE);
   gfx->setTextColor(UI_WHITE);
-  gfx->setTextSize(3);
   const char *t = T(S_EVO_TAP);
-  gfx->setCursor(CX - (int)strlen(t) * 9, y + h / 2 - 11);
+  int tlen = strlen(t);
+  int tts = (tlen <= 14) ? 3 : 2;  // auto-encoge: nombres largos en otros idiomas
+  gfx->setTextSize(tts);
+  gfx->setCursor(CX - tlen * (tts == 3 ? 9 : 6), y + h / 2 - (tts == 3 ? 11 : 8));
   gfx->print(t);
 }
 
@@ -2093,8 +2095,10 @@ void drawFarewellButton() {
   const char *nm = pet.nick[0] ? pet.nick : dexName(pet.speciesId);
   snprintf(buf, sizeof(buf), T(S_FAREWELL_BTN), nm);
   gfx->setTextColor(UI_INK);
-  gfx->setTextSize(2);
-  gfx->setCursor(CX - (int)strlen(buf) * 6, y + h / 2 - 8);
+  int blen = strlen(buf);
+  int bts = (blen <= 26) ? 2 : 1;  // auto-encoge: apodo largo + frase > 320px
+  gfx->setTextSize(bts);
+  gfx->setCursor(CX - blen * (bts == 2 ? 6 : 3), y + h / 2 - (bts == 2 ? 8 : 5));
   gfx->print(buf);
 }
 
@@ -2110,8 +2114,10 @@ void drawRunawayButton() {
   const char *nm = pet.nick[0] ? pet.nick : dexName(pet.speciesId);
   snprintf(buf, sizeof(buf), T(S_RUNAWAY_BTN), nm);
   gfx->setTextColor(C565(0xc8, 0xd2, 0xe0));
-  gfx->setTextSize(2);
-  gfx->setCursor(CX - (int)strlen(buf) * 6, y + h / 2 - 8);
+  int blen = strlen(buf);
+  int bts = (blen <= 26) ? 2 : 1;  // auto-encoge: apodo largo + frase > 320px
+  gfx->setTextSize(bts);
+  gfx->setCursor(CX - blen * (bts == 2 ? 6 : 3), y + h / 2 - (bts == 2 ? 8 : 5));
   gfx->print(buf);
 }
 
