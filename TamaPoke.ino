@@ -13,6 +13,7 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <Preferences.h>
 #include "Arduino_GFX_Library.h"
 #include "Arduino_DriveBus_Library.h"
 #include <Adafruit_XCA9554.h>
@@ -267,8 +268,20 @@ void setup() {
   pwrSetup();
   uint32_t e = rtcEpoch();
   if (e == 0) {
-    rtcSetEpoch(1767225600UL);  // RTC virgen: semilla (la hora absoluta da igual,
-    e = rtcEpoch();             // solo importan las diferencias)
+    // Sin respaldo de RTC (sin bateria) el PCF85063 pierde la hora al cortar
+    // la alimentacion. Sembrar la fecha fija haria RETROCEDER el juego
+    // (rompe racha, edad y hora de la escena); se siembra con la ultima hora
+    // vista en NVS para no retroceder nunca. Los minutos apagado se pierden
+    // igual (sin RTC no se pueden saber), pero nada se rompe.
+    uint32_t seed = 1767225600UL;  // RTC virgen de verdad: semilla fija
+    Preferences sp;
+    if (sp.begin("tamapoke", true)) {
+      uint32_t seen = sp.getUInt("seen", 0);
+      if (seen > seed) seed = seen;
+      sp.end();
+    }
+    rtcSetEpoch(seed);
+    e = rtcEpoch();
     Serial.println("RTC sin hora: sembrado, sin progresion offline esta vez");
   }
   pet.syncClock(e);
