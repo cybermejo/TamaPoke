@@ -32,9 +32,11 @@ Huge thanks to that whole community for an enormous amount of work.
 | Component | Author / source |
 |---|---|
 | GFX Library for Arduino | [moononournation](https://github.com/moononournation/Arduino_GFX) |
-| SensorLib (CST9217 touch, PCF85063 RTC) | [Lewis He / lewisxhe](https://github.com/lewisxhe/SensorLib) |
+| Arduino_DriveBus (CST820 / FT3168 touch) | [Waveshare](https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-1.8) (bundled) |
+| Adafruit_XCA9554 (GPIO expander) | [Adafruit](https://github.com/adafruit/Adafruit_XCA9554) |
+| SensorLib (PCF85063 RTC) | [Lewis He / lewisxhe](https://github.com/lewisxhe/SensorLib) |
 | XPowersLib (AXP2101 PMU) | [Lewis He / lewisxhe](https://github.com/lewisxhe/XPowersLib) |
-| Board and pinout | [Waveshare ESP32-S3-Touch-AMOLED-1.75](https://www.waveshare.com/wiki/ESP32-S3-Touch-AMOLED-1.75) |
+| Board and pinout | [Waveshare ESP32-S3-Touch-AMOLED-1.8](https://www.waveshare.com/wiki/ESP32-S3-Touch-AMOLED-1.8) |
 | Web installer | [ESP Web Tools](https://esphome.github.io/esp-web-tools/) (Nabu Casa) |
 
 TamaPoke's own code (firmware and tools) is original work.

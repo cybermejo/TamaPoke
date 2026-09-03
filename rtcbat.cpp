@@ -46,8 +46,8 @@ bool batBegin() {
   return pmuOk;
 }
 
-// Enciende la alimentacion de la AMOLED. En la Waveshare 1.75 el panel (OLED VDD)
-// cuelga del rail BLDO1 a 3.3V del AXP2101. El firmware daba por hecho que estaba
+// Enciende la alimentacion de la AMOLED. En la Waveshare 1.8 (igual que en la
+// 1.75) el panel (OLED VDD) cuelga del rail BLDO1 a 3.3V del AXP2101. El firmware daba por hecho que estaba
 // encendido; si el PMU se resetea (drenaje total), BLDO1 queda OFF y la pantalla
 // se ve negra aunque el resto funcione. Hay que llamarla ANTES de gfx->begin().
 void pmuEnablePanel() {

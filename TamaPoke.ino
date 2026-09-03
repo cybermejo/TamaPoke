@@ -1,9 +1,11 @@
 // TamaPoke - tamagotchi pixel art inspirado en la gen 1
-// para Waveshare ESP32-S3-Touch-AMOLED-1.75
+// para Waveshare ESP32-S3-Touch-AMOLED-1.8 (368x448, rectangular vertical)
 //
-// Librerias (Library Manager o repo de Waveshare):
-//   - "GFX Library for Arduino" (moononournation), con soporte CO5300 QSPI
-//   - "SensorLib" (Lewis He), driver tactil CST9217
+// Librerias (Library Manager o repo de Waveshare ESP32-S3-Touch-AMOLED-1.8,
+// examples/arduino-v2/libraries para la V2 / examples/arduino/libraries para la V1):
+//   - "GFX Library for Arduino" (moononournation), drivers CO5300 (V2) / SH8601 (V1) por QSPI
+//   - "Arduino_DriveBus" (Waveshare, bundled) + "Adafruit_XCA9554" (expansor de reset)
+//     para el tactil CST820 (V2) / FT3168 (V1)
 //
 // Placa: ESP32S3 Dev Module | Flash 16MB | PSRAM: OPI PSRAM | USB CDC On Boot: Enabled
 //
@@ -12,7 +14,8 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include "Arduino_GFX_Library.h"
-#include "TouchDrvCSTXXX.hpp"
+#include "Arduino_DriveBus_Library.h"
+#include <Adafruit_XCA9554.h>
 #include "pin_config.h"
 #include "species.h"
 #include "dex.h"
@@ -24,16 +27,33 @@
 
 // Version del firmware. Subir este numero en cada release (y manifest.json para
 // el instalador web). Se muestra en la pantalla de ajustes y por serie al arrancar.
-#define FW_VERSION "1.5"
+#define FW_VERSION "2.0"
 
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
   LCD_CS, LCD_SCLK, LCD_SDIO0, LCD_SDIO1, LCD_SDIO2, LCD_SDIO3);
-Arduino_CO5300 *panel = new Arduino_CO5300(
-  bus, LCD_RESET, 0 /*rotation*/, LCD_WIDTH, LCD_HEIGHT, 6, 0, 0, 0);
+// El panel se crea en setup() tras detectar la revision por I2C (ver abajo).
+// V1 = SH8601 + FT3168 (0x38), V2 = CO5300 + CST820 (0x15, hardware actual).
+Arduino_GFX *panel = nullptr;      // base de dibujo (V1 o V2)
+Arduino_CO5300 *co5300 = nullptr;  // V2 (dueno de setBrightness)
+Arduino_SH8601 *sh8601 = nullptr;  // V1 (dueno de setBrightness)
 // Framebuffer completo en PSRAM: dibujamos todo y hacemos flush() (sin parpadeo)
-Arduino_Canvas *gfx = new Arduino_Canvas(LCD_WIDTH, LCD_HEIGHT, panel);
+Arduino_Canvas *gfx = nullptr;     // se crea en setup() tras detectar el panel
+void setPanelBrightness(uint8_t b) {
+  // setBrightness es por-IC (registro de brillo), no esta en la clase base
+  if (co5300) co5300->setBrightness(b);
+  else if (sh8601) sh8601->setBrightness(b);
+}
 
-TouchDrvCST92xx touch;
+// Tactil V2 CST820 / V1 FT3168 via Arduino_DriveBus (como en los ejemplos
+// oficiales). El bus I2C se crea aqui como en los ejemplos (Wire.begin en setup).
+std::shared_ptr<Arduino_IIC_DriveBus> IIC_Bus =
+  std::make_shared<Arduino_HWIIC>(IIC_SDA, IIC_SCL, &Wire);
+void touchIsr();
+std::unique_ptr<Arduino_IIC> touchDrv;
+void touchIsr() {
+  if (touchDrv) touchDrv->IIC_Interrupt_Flag = true;
+}
+Adafruit_XCA9554 expander;
 Pet pet;
 
 // sprite animado de la SD para la especie actual (si existe el archivo)
@@ -49,9 +69,10 @@ struct {
   uint8_t act = PMD_IDLE;
   uint32_t t0 = 0;      // inicio de la animacion en curso
   uint32_t until = 0;   // fin del estado actual
-  float x = 233, targetX = 233;
+  float x = LCD_WIDTH / 2, targetX = LCD_WIDTH / 2;
 } beh;
-#define PET_GROUND 304  // linea de suelo de la mascota
+#define PANEL_Y 296   // franja inferior: barras + botones sobre el paisaje
+#define PET_GROUND 288  // linea de suelo de la mascota (justo sobre el panel)
 PmdMon galleryPmd;  // sprite grande de la vista detalle de la galeria (PMD/TPK2, legal)
 
 // galeria pokedex
@@ -98,32 +119,31 @@ int flashIdxForDex(int16_t dex) {
   return (dex >= 1 && dex <= 9) ? IDX[dex] : -1;
 }
 
-#define CX 233  // centro de la pantalla redonda
-#define CY 233
-#define PET_CY 202  // centro vertical del sprite
+#define CX (LCD_WIDTH / 2)   // centro horizontal (pantalla rectangular 368x448)
+#define CY (LCD_HEIGHT / 2)
+#define PET_CY 190  // centro vertical del sprite
 
 static const uint16_t INK_K = 0x18C4;  // spriteColor('k')
 
-// botones de icono siguiendo el arco inferior de la pantalla redonda
-// (los exteriores van mas altos para no salirse del circulo)
+// botones de icono en fila sobre el panel inferior rectangular
 struct Btn {
   int16_t cx, cy;
   const char *const *icon;
 };
 Btn buttons[4] = {
-  { 140, 390, SPR_ICON_FOOD },   // comer
-  { 202, 404, SPR_ICON_PLAY },   // jugar
-  { 264, 404, SPR_ICON_LIGHT },  // luz
-  { 326, 390, SPR_ICON_CLEAN },  // bano
+  { 54, 392, SPR_ICON_FOOD },   // comer
+  { 137, 392, SPR_ICON_PLAY },  // jugar
+  { 220, 392, SPR_ICON_LIGHT }, // luz
+  { 303, 392, SPR_ICON_CLEAN }, // bano
 };
 #define BTN_HALF 26  // boton de 52x52
-#define BTN_HIT 36   // radio tactil (un poco mas generoso)
+#define BTN_HIT 40   // radio tactil (tope sin solapar: los centros distan 83px)
 
 // grietas del huevo (pixeles 'k' sobre el sprite)
 static const uint8_t CRACK1[][2] = { {15,8},{16,9},{15,10} };
 static const uint8_t CRACK2[][2] = { {11,13},{12,14},{11,15},{20,12},{19,13},{20,14} };
 // estrellas del modo noche
-static const uint16_t STARS[][2] = { {120,140},{330,120},{370,210},{95,230},{280,90},{160,95} };
+static const uint16_t STARS[][2] = { {90,130},{260,110},{300,190},{70,210},{220,80},{130,85} };
 
 bool wasPressed = false;
 // eleccion de inicial (primera partida): Bulbasaur / Charmander / Squirtle, 3 filas
@@ -136,15 +156,11 @@ static const int16_t STARTER_DEX[3] = { 1, 4, 7 };
 #define EVO_BTN_H 64
 #define EVO_BTN_X (CX - EVO_BTN_W / 2)
 #define EVO_BTN_Y 172
-// boton-CTA de despedida (mas ancho: lleva el nombre + frase)
-#define FAR_BTN_W 408
+// boton-CTA de despedida (mas ancho: lleva el nombre + frase; cabe en 368px)
+#define FAR_BTN_W 320
 #define FAR_BTN_H 58
 #define FAR_BTN_X (CX - FAR_BTN_W / 2)
 #define FAR_BTN_Y 176
-// el CST9217 avisa por el pin INT cuando hay datos tactiles; lo usamos para no
-// leer el bus I2C mientras el chip esta dormido (esa lectura se colgaba ~1s)
-volatile bool gTouchIrq = false;
-void IRAM_ATTR touchIsr() { gTouchIrq = true; }
 uint32_t lastRender = 0;
 // proteccion del AMOLED: atenuado por inactividad
 uint32_t lastInteract = 0;
@@ -168,11 +184,50 @@ void setup() {
   Serial.printf("TamaPoke fw v%s\n", FW_VERSION);
   loadLang();  // idioma guardado (ES por defecto)
   Wire.begin(IIC_SDA, IIC_SCL);
-  // CST9217 (tactil), AXP2101 (PMU) y PCF85063 (RTC) comparten este bus I2C.
-  // Red de seguridad para PMU/RTC (SensorLib NO respeta este timeout en el
-  // tactil; el cuelgue del tactil dormido se resuelve gateando por INT, ver
-  // handleTouch).
+  // Detecta la revision de la placa por la direccion I2C del tactil (patron
+  // verificado en esta misma placa con el proyecto esp32-fluid-cube):
+  // 0x15 = V2 (CO5300 + CST820, hardware actual), 0x38 = V1 (SH8601 + FT3168).
+  // Sin respuesta se asume V2. Tactil, AXP2101, PCF85063 y XCA9554 comparten I2C.
   Wire.setTimeOut(50);
+  Wire.beginTransmission(0x15);
+  bool hasV2 = (Wire.endTransmission() == 0);
+  Wire.beginTransmission(0x38);
+  bool hasV1 = (Wire.endTransmission() == 0);
+  bool isV1 = !hasV2 && hasV1;
+  if (isV1) {
+    sh8601 = new Arduino_SH8601(bus, GFX_NOT_DEFINED /* RST via expansor */,
+                                0 /*rotation*/, LCD_WIDTH, LCD_HEIGHT);
+    panel = sh8601;
+  } else {
+    // El ejemplo V2 oficial pasa col_offset1=16 para este panel.
+    co5300 = new Arduino_CO5300(bus, GFX_NOT_DEFINED /* RST via expansor */,
+                                0 /*rotation*/, LCD_WIDTH, LCD_HEIGHT, 16, 0, 0, 0);
+    panel = co5300;
+  }
+  gfx = new Arduino_Canvas(LCD_WIDTH, LCD_HEIGHT, panel);
+  Serial.printf("[display] %s (%dx%d QSPI)\n", isV1 ? "V1 / SH8601" : "V2 / CO5300",
+                LCD_WIDTH, LCD_HEIGHT);
+
+  // Expansor XCA9554: resetea LCD + tactil (pines 0/1/2, como en los ejemplos
+  // oficiales) y alimenta la SD (pin 7 en alto). Sin esto la pantalla/tactil
+  // pueden no arrancar.
+  if (!expander.begin(EXPANDER_ADDR)) {
+    Serial.println("XCA9554 no detectado (sigo sin reset por expansor)");
+  } else {
+    expander.pinMode(0, OUTPUT);
+    expander.pinMode(1, OUTPUT);
+    expander.pinMode(2, OUTPUT);
+    expander.digitalWrite(0, LOW);
+    expander.digitalWrite(1, LOW);
+    expander.digitalWrite(2, LOW);
+    delay(20);
+    expander.digitalWrite(0, HIGH);
+    expander.digitalWrite(1, HIGH);
+    expander.digitalWrite(2, HIGH);
+    expander.pinMode(7, OUTPUT);
+    expander.digitalWrite(7, HIGH);
+    delay(50);
+  }
 
   // CRITICO: encender la alimentacion del panel (BLDO1=OLED VDD 3.3V) ANTES de
   // inicializar el display. Si el PMU se reseteo (drenaje total), este rail
@@ -182,23 +237,25 @@ void setup() {
   // QSPI a 80MHz (por defecto 40): el flush del framebuffer es el cuello de
   // botella del fps (~56ms a 40MHz). Si el panel mostrara basura, bajar a 40M.
   if (!gfx->begin(80000000)) Serial.println("gfx->begin() fallo");
-  panel->setBrightness(180);
+  setPanelBrightness(180);
 
-  touch.setPins(TP_RESET, TP_INT);
+  if (isV1) touchDrv.reset(new Arduino_FT3x68(IIC_Bus, FT3168_DEVICE_ADDRESS,
+                                              DRIVEBUS_DEFAULT_VALUE, TP_INT, touchIsr));
+  else touchDrv.reset(new Arduino_CST816x(IIC_Bus, CST816T_DEVICE_ADDRESS,
+                                          DRIVEBUS_DEFAULT_VALUE, TP_INT, touchIsr));
   bool touchOk = false;
-  for (int i = 0; i < 3 && !touchOk; i++) {  // a veces falla al primer intento
-    touchOk = touch.begin(Wire, 0x5A, IIC_SDA, IIC_SCL);
-    if (!touchOk) delay(150);
+  for (int i = 0; i < 5 && !touchOk; i++) {  // a veces falla al primer intento
+    touchOk = touchDrv->begin();
+    if (!touchOk) delay(300);
   }
-  if (!touchOk) Serial.println("CST9217 no detectado");
-  // begin() deja el chip en modo comando (lee la identidad y no sale);
-  // hace falta un reset por hardware para que vuelva a reportar toques
-  touch.reset();
-  touch.setMaxCoordinates(LCD_WIDTH, LCD_HEIGHT);
-  touch.setMirrorXY(true, true);  // el panel esta montado girado 180 grados
-  // INT activo-bajo: salta cuando hay datos. Gatea las lecturas I2C (ver loop)
-  pinMode(TP_INT, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(TP_INT), touchIsr, FALLING);
+  if (!touchOk) {
+    Serial.println(isV1 ? "FT3168 no detectado" : "CST820 no detectado");
+  } else {
+    Serial.println("tactil OK");
+  }
+  touchDrv->IIC_Write_Device_State(
+    touchDrv->Arduino_IIC_Touch::Device::TOUCH_DEVICE_INTERRUPT_MODE,
+    touchDrv->Arduino_IIC_Touch::Device_Mode::TOUCH_DEVICE_INTERRUPT_PERIODIC);
 
   pet.begin();
   sdBegin();
@@ -229,7 +286,7 @@ void ensureMon() {
   monShinyFor = pet.shiny;
   mon.unload();
   pmd.unload();
-  beh.x = beh.targetX = 233;
+  beh.x = beh.targetX = CX;
   beh.mode = 0;
   beh.until = 0;
   if (pet.speciesId >= 1 && pet.speciesId <= DEX_COUNT) {
@@ -319,7 +376,7 @@ void updateBrightness(uint32_t now) {
   static uint8_t current = 255;
   if (target != current) {
     current = target;
-    panel->setBrightness(target);
+    setPanelBrightness(target);
   }
 }
 
@@ -410,9 +467,10 @@ void handleSerial() {
     Serial.println();
     Serial.println("DONE");
   } else if (line == "HEALTH") {
-    Serial.printf("up=%lus heap=%u min=%u sd=%d mon=%d\n",
+    Serial.printf("up=%lus heap=%u min=%u sd=%d mon=%d snd=%d\n",
                   (unsigned long)(millis() / 1000), ESP.getFreeHeap(),
-                  ESP.getMinFreeHeap(), sdReady, pmd.loaded || mon.loaded);
+                  ESP.getMinFreeHeap(), sdReady, pmd.loaded || mon.loaded,
+                  audioEnabled());
     Serial.println("DONE");
   } else if (line == "STATS") {
     Serial.printf("spec=%d nv=%u com=%u fel=%u ene=%u lim=%u desc=%u sd=%d mon=%d bat=%d usb=%d rtc=%u\n",
@@ -433,7 +491,7 @@ void handleSerial() {
 // ---------- entrada tactil ----------
 
 bool inPetZone(int16_t x, int16_t y) {
-  return x > 110 && x < 356 && y > 95 && y < 310;
+  return x > 60 && x < LCD_WIDTH - 60 && y > 90 && y < PET_GROUND + 10;
 }
 
 // el toque se resuelve al LEVANTAR el dedo para distinguir tap de deslizar
@@ -441,13 +499,25 @@ void handleTouch() {
   static uint32_t lastPoll = 0;
   if (millis() - lastPoll < 20) return;  // 50 Hz le sobra a un dedo
   lastPoll = millis();
-  // solo tocamos el bus si el chip aviso por INT o si el dedo sigue abajo (hay
-  // que detectar el levantamiento). Leer el CST9217 dormido se colgaba ~1s y
-  // congelaba el loop entero; SensorLib no respeta el timeout de Wire.
-  if (!gTouchIrq && !wasPressed) return;
-  gTouchIrq = false;
-  int16_t x, y;
-  bool pressed = touch.getPoint(&x, &y, 1) > 0;
+  if (!touchDrv) return;
+  // CST820/FT3168 via Arduino_DriveBus: numero de dedos + coordenadas directas
+  // (los ejemplos oficiales leen a 100 Hz sin gateo; estos chips no se cuelgan
+  // dormidos como el CST9217 de la 1.75).
+  int16_t x = tXl, y = tYl;
+  bool pressed = false;
+  int32_t fingers =
+    touchDrv->IIC_Read_Device_Value(touchDrv->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
+  if (fingers > 0) {
+    int32_t tx = touchDrv->IIC_Read_Device_Value(
+      touchDrv->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
+    int32_t ty = touchDrv->IIC_Read_Device_Value(
+      touchDrv->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
+    if (tx >= 0 && tx < LCD_WIDTH && ty >= 0 && ty < LCD_HEIGHT) {
+      x = (int16_t)tx;
+      y = (int16_t)ty;
+      pressed = true;
+    }
+  }
 
   // saco de entrenamiento: cada toque cuenta al instante (aporrear rapido)
   if (sackOpen) {
@@ -547,12 +617,26 @@ void onSwipe(int dir) {
   }
 }
 
+void pressButton(int i) {
+  Serial.printf("BTN %d\n", i);
+  sfxPlay(SFX_TAP);
+  if (i == 0) {
+    if (!pet.sleeping) feedMenuUntil = millis() + 10000;
+  } else if (i == 1) {
+    startGame();
+  } else if (i == 2) {
+    pet.toggleLight();
+  } else {
+    startBath();
+  }
+}
+
 void onTap(int16_t x, int16_t y) {
   // Serial.printf("TOUCH %d %d\n", x, y);  // diagnostico (silenciado: satura el log)
   if (pet.awaitingStarter()) {  // primera partida: elegir inicial
     for (int i = 0; i < 3; i++) {
       int ry = STARTER_ROW_Y + i * (STARTER_ROW_H + STARTER_ROW_GAP);
-      if (x >= 70 && x <= 396 && y >= ry && y <= ry + STARTER_ROW_H) {
+      if (x >= 30 && x <= 338 && y >= ry && y <= ry + STARTER_ROW_H) {
         pet.chooseStarter(STARTER_DEX[i]);
         sfxPlay(SFX_TAP);
         break;
@@ -575,7 +659,13 @@ void onTap(int16_t x, int16_t y) {
   if (pet.ceremony) return;  // durante la despedida no hay botones
   if (cardOpen) {
     if (cardPage == 0 && y < 84) openKeyboard();  // tocar el nombre = renombrar
-    else if (cardPage == 1 && y >= 300 && y <= 340 && x >= 96 && x <= 370) {
+    else if (y >= 388 && y <= 412) {  // puntos: salto directo de pagina
+      int i = (x - (CX - 52)) / 26;
+      if (i < 0) i = 0;
+      if (i > 3) i = 3;
+      cardPage = i;
+    }
+    else if (cardPage == 1 && y >= 292 && y <= 368 && x >= 40 && x <= 328) {
       cardOpen = false;            // boton ENTRENAR FUERZA
       startSack();
     } else {
@@ -588,8 +678,8 @@ void onTap(int16_t x, int16_t y) {
     return;
   }
   if (choiceKind) {          // dialogo de decision: boton accion (arriba) / mantener (abajo)
-    bool b1 = (x >= 93 && x <= 373 && y >= 206 && y <= 258);  // accion
-    bool b2 = (x >= 93 && x <= 373 && y >= 268 && y <= 320);  // mantener / quedaros
+    bool b1 = (x >= 44 && x <= 324 && y >= 206 && y <= 258);  // accion
+    bool b2 = (x >= 44 && x <= 324 && y >= 268 && y <= 320);  // mantener / quedaros
     if (choiceKind == 1) {                 // evolucion
       if (b1) { int16_t old = pet.speciesId; pet.evolve(); evoPmd.load(old, pet.shiny); }
       else if (b2) pet.declineEvolve();
@@ -601,15 +691,16 @@ void onTap(int16_t x, int16_t y) {
     return;
   }
   if (confirmUntil) {        // dialogo "soltar?": SI / NO
-    if (millis() < confirmUntil && x >= 118 && x <= 218 && y >= 252 && y <= 304) {
+    if (millis() < confirmUntil && x >= 65 && x <= 165 && y >= 252 && y <= 304) {
       pet.release();
     }
     confirmUntil = 0;
     return;
   }
-  if (feedMenuUntil) {       // selector de comida
-    if (millis() < feedMenuUntil && y >= 288 && y <= 352 && x >= 101 && x <= 365) {
-      int item = (x - 101) / 66;
+  if (feedMenuUntil) {       // selector de comida (iconos grandes 64px)
+    if (millis() < feedMenuUntil && y >= 272 && y <= 360 && x >= 88 && x <= 367) {
+      int item = (x - 88) / 70;
+      if (item > 3) item = 3;
       if (item == 3) pet.feedCandy();
       else pet.feedBerry(item);
       sfxPlay(SFX_EAT);
@@ -634,20 +725,18 @@ void onTap(int16_t x, int16_t y) {
     if (pet.canRunawayNow()) { pet.startRunaway(); return; }
     if (pet.wantFarewellButton()) { choiceKind = 2; choiceUntil = millis() + 12000; return; }
   }
+  // botones de accion: toda la franja inferior (y>=360) reparte el toque a la
+  // columna mas cercana (zonas ~90px: mucho mas facil que acertar al icono de
+  // 52px con el dedo, sobre todo al borde de la pantalla)
+  if (y >= 360) {
+    int i = (x < 95) ? 0 : (x < 178) ? 1 : (x < 261) ? 2 : 3;
+    pressButton(i);
+    return;
+  }
   for (int i = 0; i < 4; i++) {
     int dx = x - buttons[i].cx, dy = y - buttons[i].cy;
     if (dx * dx + dy * dy <= BTN_HIT * BTN_HIT) {
-      Serial.printf("BTN %d\n", i);
-      sfxPlay(SFX_TAP);
-      if (i == 0) {
-        if (!pet.sleeping) feedMenuUntil = millis() + 6000;
-      } else if (i == 1) {
-        startGame();
-      } else if (i == 2) {
-        pet.toggleLight();
-      } else {
-        startBath();
-      }
+      pressButton(i);
       return;
     }
   }
@@ -667,7 +756,7 @@ uint16_t inkColor() { return gNight ? UI_INK_NIGHT : UI_INK; }
 // ---------- escena de fondo: bioma del tipo + hora real del RTC ----------
 
 #define C565(r, g, b) ((uint16_t)((((r) >> 3) << 11) | (((g) >> 2) << 5) | ((b) >> 3)))
-#define HORIZON 232  // linea donde el cielo se encuentra con el suelo
+#define HORIZON 200  // linea donde el cielo se encuentra con el suelo
 
 uint16_t lerp565(uint16_t a, uint16_t b, int i, int n) {
   if (n <= 0) return a;
@@ -695,7 +784,7 @@ static const uint16_t BIOME_SOIL[6] = {
 
 void drawClouds(uint32_t now, uint16_t col) {
   for (int k = 0; k < 2; k++) {
-    int cx = (int)((now / 50 + k * 250) % 560) - 40;
+    int cx = (int)((now / 50 + k * 250) % 480) - 50;
     int cy = 70 + k * 34;
     gfx->fillCircle(cx, cy, 16, col);
     gfx->fillCircle(cx + 18, cy + 3, 13, col);
@@ -713,18 +802,18 @@ void drawScene(uint8_t biome, uint32_t now, bool night) {
 
   // cielo en bandas
   for (int y = 0; y < HORIZON; y += 8)
-    gfx->fillRect(0, y, 466, 8, lerp565(top, bot, y, HORIZON));
+    gfx->fillRect(0, y, LCD_WIDTH, 8, lerp565(top, bot, y, HORIZON));
 
   // sol o luna
   if (night) {
-    gfx->fillCircle(360, 78, 24, C565(0xe8, 0xee, 0xf5));
-    gfx->fillCircle(370, 72, 22, lerp565(top, bot, 78, HORIZON));  // creciente
+    gfx->fillCircle(282, 78, 24, C565(0xe8, 0xee, 0xf5));
+    gfx->fillCircle(292, 72, 22, lerp565(top, bot, 78, HORIZON));  // creciente
     for (auto &st : STARS) gfx->fillRect(st[0], st[1], 4, 4, UI_WHITE);
   } else if (h < 18) {
-    gfx->fillCircle(360, 84, 26, h < 8 ? C565(0xff, 0xd9, 0x8a) : C565(0xff, 0xe7, 0x9f));
+    gfx->fillCircle(282, 84, 26, h < 8 ? C565(0xff, 0xd9, 0x8a) : C565(0xff, 0xe7, 0x9f));
     drawClouds(now, C565(0xff, 0xff, 0xff));
   } else {
-    gfx->fillCircle(233, HORIZON - 6, 34, C565(0xff, 0xf1, 0xc8));  // sol poniente
+    gfx->fillCircle(CX, HORIZON - 6, 34, C565(0xff, 0xf1, 0xc8));  // sol poniente
   }
 
   // mar de la playa: una franja de agua sobre la arena
@@ -732,44 +821,44 @@ void drawScene(uint8_t biome, uint32_t now, bool night) {
   if (night) soil = lerp565(soil, C565(0x16, 0x1c, 0x30), 9, 16);
   if (biome == 1) {
     uint16_t sea = night ? C565(0x1c, 0x34, 0x52) : C565(0x4f, 0x96, 0xc4);
-    gfx->fillRect(0, HORIZON - 26, 466, 26, sea);
+    gfx->fillRect(0, HORIZON - 26, LCD_WIDTH, 26, sea);
     for (int i = 0; i < 3; i++) {
       int wy = HORIZON - 22 + i * 7;
       uint16_t fc = night ? C565(0x3a, 0x58, 0x78) : C565(0xbf, 0xe6, 0xf5);
-      gfx->fillRect(60 + ((now / 60 + i * 30) % 60), wy, 26, 2, fc);
-      gfx->fillRect(300 - ((now / 60 + i * 20) % 60), wy, 26, 2, fc);
+      gfx->fillRect(45 + ((now / 60 + i * 30) % 45), wy, 22, 2, fc);
+      gfx->fillRect(235 - ((now / 60 + i * 20) % 45), wy, 22, 2, fc);
     }
   }
 
   // suelo
-  gfx->fillRect(0, HORIZON, 466, 466 - HORIZON, soil);
+  gfx->fillRect(0, HORIZON, LCD_WIDTH, LCD_HEIGHT - HORIZON, soil);
   uint16_t hill = lerp565(soil, night ? C565(0x0c, 0x12, 0x24) : C565(0xff, 0xff, 0xff), 3, 16);
-  gfx->fillRoundRect(-60, HORIZON - 14, 586, 60, 30, hill);
+  gfx->fillRoundRect(-40, HORIZON - 14, LCD_WIDTH + 80, 60, 30, hill);
 
   // detalles del bioma
   uint16_t dk = lerp565(soil, C565(0x10, 0x18, 0x20), night ? 11 : 7, 16);
   if (biome == 2) {  // bosque: coniferas en silueta
-    for (int tx : { 60, 150, 360, 416 }) {
+    for (int tx : { 40, 115, 250, 320 }) {
       gfx->fillTriangle(tx, HORIZON - 46, tx - 16, HORIZON, tx + 16, HORIZON, dk);
       gfx->fillTriangle(tx, HORIZON - 60, tx - 12, HORIZON - 28, tx + 12, HORIZON - 28, dk);
     }
   } else if (biome == 3) {  // volcan: rocas y brasas
-    gfx->fillTriangle(70, HORIZON, 40, HORIZON + 30, 100, HORIZON + 30, dk);
-    gfx->fillTriangle(400, HORIZON + 4, 372, HORIZON + 30, 430, HORIZON + 30, dk);
+    gfx->fillTriangle(55, HORIZON, 30, HORIZON + 30, 80, HORIZON + 30, dk);
+    gfx->fillTriangle(315, HORIZON + 4, 292, HORIZON + 30, 340, HORIZON + 30, dk);
     if (!night)
       for (int e = 0; e < 4; e++)
-        gfx->fillRect(120 + e * 70, HORIZON + 8 + (e % 2) * 6, 4, 4, C565(0xff, 0x9b, 0x3a));
+        gfx->fillRect(90 + e * 55, HORIZON + 8 + (e % 2) * 6, 4, 4, C565(0xff, 0x9b, 0x3a));
   } else if (biome == 4) {  // montana: cumbres al fondo
-    gfx->fillTriangle(140, HORIZON - 50, 60, HORIZON, 220, HORIZON, dk);
-    gfx->fillTriangle(330, HORIZON - 38, 250, HORIZON, 410, HORIZON, dk);
+    gfx->fillTriangle(110, HORIZON - 50, 45, HORIZON, 175, HORIZON, dk);
+    gfx->fillTriangle(260, HORIZON - 38, 195, HORIZON, 325, HORIZON, dk);
   } else if (biome == 5 && !night) {  // nieve: copos cayendo
     for (int f = 0; f < 10; f++) {
-      int fx = (f * 53 + now / 40) % 466;
+      int fx = (f * 53 + now / 40) % LCD_WIDTH;
       int fy = (f * 90 + now / 18) % HORIZON;
       gfx->fillRect(fx, fy, 3, 3, UI_WHITE);
     }
   } else if (biome == 0) {  // pradera: matas de hierba
-    for (int gx : { 80, 175, 300, 395 })
+    for (int gx : { 55, 130, 225, 300 })
       for (int b = -1; b <= 1; b++)
         gfx->fillRect(gx + b * 5, HORIZON + 6, 2, 8 + (b == 0 ? 4 : 0), dk);
   }
@@ -777,8 +866,7 @@ void drawScene(uint8_t biome, uint32_t now, bool night) {
 
 // primera partida: elige inicial entre Bulbasaur / Charmander / Squirtle
 void renderStarterSelect() {
-  gfx->fillScreen(RGB565_BLACK);
-  gfx->fillCircle(CX, CY, 231, UI_BG_DAY);
+  gfx->fillScreen(UI_BG_DAY);
   const char *t = T(S_CHOOSE_STARTER);
   gfx->setTextColor(UI_INK);
   gfx->setTextSize(2);
@@ -788,13 +876,13 @@ void renderStarterSelect() {
     int16_t d = STARTER_DEX[i];
     const DexEntry &de = DEX_TBL[d];
     int ry = STARTER_ROW_Y + i * (STARTER_ROW_H + STARTER_ROW_GAP);
-    gfx->fillRoundRect(70, ry, 326, STARTER_ROW_H, 14, lerp565(de.accent, UI_WHITE, 6, 8));
-    gfx->drawRoundRect(70, ry, 326, STARTER_ROW_H, 14, de.accent);
+    gfx->fillRoundRect(34, ry, 300, STARTER_ROW_H, 14, lerp565(de.accent, UI_WHITE, 6, 8));
+    gfx->drawRoundRect(34, ry, 300, STARTER_ROW_H, 14, de.accent);
     const uint8_t *th = thumbs.get(d);     // miniatura del inicial (si la SD esta lista)
-    if (th) drawThumb(th, 76, ry - 5, 3, false);
+    if (th) drawThumb(th, 40, ry - 5, 3, false);
     gfx->setTextColor(UI_INK);
     gfx->setTextSize(3);
-    gfx->setCursor(178, ry + 24);
+    gfx->setCursor(132, ry + 24);
     gfx->print(dexName(d));
   }
   gfx->flush();
@@ -831,7 +919,7 @@ void render() {
   }
   int h = sceneHour();
   gNight = pet.sleeping || h < 6 || h >= 20;
-  // drawScene cubre los 466x466 completos: sin fillScreen(NEGRO) previo para
+  // drawScene cubre todo el framebuffer: sin fillScreen previo para
   // que un flush DMA solapado nunca capture negro a medias (anti-parpadeo)
   drawScene(pet.isEgg() ? 0 : DEX_TBL[pet.speciesId].biome, millis(), gNight);
 
@@ -863,7 +951,7 @@ void render() {
     }
     char reg[24];
     snprintf(reg, sizeof(reg), T(S_POKEDEX_FMT), pet.registeredCount());
-    gfx->fillRect(0, 312, 466, 154, gNight ? UI_BG_NIGHT : UI_BG_DAY);
+    gfx->fillRect(0, PANEL_Y, LCD_WIDTH, LCD_HEIGHT - PANEL_Y, gNight ? UI_BG_NIGHT : UI_BG_DAY);
     gfx->setTextColor(inkColor());
     gfx->setTextSize(2);
     gfx->setCursor(CX - strlen(reg) * 6, 348);
@@ -879,7 +967,7 @@ void render() {
     drawBath();
     drawPoops();
     // panel inferior: base limpia para barras y botones sobre el paisaje
-    gfx->fillRect(0, 312, 466, 154, gNight ? UI_BG_NIGHT : UI_BG_DAY);
+    gfx->fillRect(0, PANEL_Y, LCD_WIDTH, LCD_HEIGHT - PANEL_Y, gNight ? UI_BG_NIGHT : UI_BG_DAY);
     drawBars();
     drawButtons();
     drawCelebration();
@@ -900,12 +988,12 @@ void render() {
     if (millis() > feedMenuUntil) {
       feedMenuUntil = 0;
     } else {
-      gfx->fillRoundRect(101, 288, 264, 64, 14, UI_WHITE);
-      gfx->drawRoundRect(101, 288, 264, 64, 14, inkColor());
-      drawMap(SPR_ICON_FOOD, 16, 110, 296, 3, false);
-      drawMap(SPR_ICON_BERRY_B, 16, 176, 296, 3, false);
-      drawMap(SPR_ICON_BERRY_G, 16, 242, 296, 3, false);
-      drawMap(SPR_ICON_CANDY, 16, 308, 296, 3, false);
+      gfx->fillRoundRect(88, 272, 280, 88, 14, UI_WHITE);
+      gfx->drawRoundRect(88, 272, 280, 88, 14, inkColor());
+      drawMap(SPR_ICON_FOOD, 16, 92, 280, 4, false);
+      drawMap(SPR_ICON_BERRY_B, 16, 162, 280, 4, false);
+      drawMap(SPR_ICON_BERRY_G, 16, 232, 280, 4, false);
+      drawMap(SPR_ICON_CANDY, 16, 302, 280, 4, false);
     }
   }
 
@@ -914,20 +1002,20 @@ void render() {
     if (millis() > confirmUntil) {
       confirmUntil = 0;
     } else {
-      gfx->fillRoundRect(94, 168, 278, 152, 16, UI_WHITE);
-      gfx->drawRoundRect(94, 168, 278, 152, 16, UI_INK);
+      gfx->fillRoundRect(45, 168, 278, 152, 16, UI_WHITE);
+      gfx->drawRoundRect(45, 168, 278, 152, 16, UI_INK);
       char q[28];
       snprintf(q, sizeof(q), T(S_RELEASE_FMT), dexName(pet.speciesId));
       gfx->setTextColor(UI_INK);
       gfx->setTextSize(2);
       gfx->setCursor(CX - strlen(q) * 6, 196);
       gfx->print(q);
-      gfx->fillRoundRect(118, 252, 100, 52, 12, UI_BAR_OK);
+      gfx->fillRoundRect(65, 252, 100, 52, 12, UI_BAR_OK);
       gfx->setTextColor(UI_WHITE);
-      gfx->setCursor(118 + (100 - (int)strlen(T(S_YES)) * 12) / 2, 270);
+      gfx->setCursor(65 + (100 - (int)strlen(T(S_YES)) * 12) / 2, 270);
       gfx->print(T(S_YES));
-      gfx->fillRoundRect(248, 252, 100, 52, 12, UI_BAR_BAD);
-      gfx->setCursor(248 + (100 - (int)strlen(T(S_NO)) * 12) / 2, 270);
+      gfx->fillRoundRect(203, 252, 100, 52, 12, UI_BAR_BAD);
+      gfx->setCursor(203 + (100 - (int)strlen(T(S_NO)) * 12) / 2, 270);
       gfx->print(T(S_NO));
     }
   }
@@ -944,19 +1032,19 @@ void render() {
 // ---------- minijuego: toques con la pokeball ----------
 
 void startGame() {
-  if (pet.isEgg() || pet.sleeping || pet.ceremony) return;
+  if (pet.isEgg() || pet.sleeping || pet.ceremony) { sfxPlay(SFX_DENY); return; }
   gameOpen = true;
   gameOverUntil = 0;
   gameScore = 0;
   gameMisses = 0;
   gameNewHi = false;
   hitTime = 0;
-  gamePetX = 233;
+  gamePetX = CX;
   respawnBall();
 }
 
 void respawnBall() {
-  ballX = 150 + random(166);
+  ballX = CX - 83 + random(166);
   ballY = 96;
   float sp = 1.6f + gameScore * 0.05f;  // mas viva segun avanzas
   if (sp > 4.0f) sp = 4.0f;
@@ -992,19 +1080,10 @@ void stepGame() {
   ballVY += grav;
   ballX += ballVX;
   ballY += ballVY;
-  // rebote en la pared circular
-  float dx = ballX - CX, dy = ballY - CY;
-  float d = sqrtf(dx * dx + dy * dy);
-  if (d > 205) {
-    float nx = dx / d, ny = dy / d;
-    float dot = ballVX * nx + ballVY * ny;
-    if (dot > 0) {
-      ballVX = (ballVX - 2 * dot * nx) * 0.85f;
-      ballVY = (ballVY - 2 * dot * ny) * 0.85f;
-    }
-    ballX = CX + nx * 205;
-    ballY = CY + ny * 205;
-  }
+  // rebote en las paredes rectangulares (pantalla 368x448, sin circulo)
+  if (ballX < 24) { ballX = 24; if (ballVX < 0) ballVX = -ballVX * 0.85f; }
+  if (ballX > LCD_WIDTH - 24) { ballX = LCD_WIDTH - 24; if (ballVX > 0) ballVX = -ballVX * 0.85f; }
+  if (ballY < 80) { ballY = 80; if (ballVY < 0) ballVY = -ballVY * 0.85f; }
   if (ballY > 384) {  // al suelo
     if (++gameMisses >= 3) {
       gameNewHi = (gameScore > pet.gameHi);
@@ -1025,7 +1104,7 @@ void stepGame() {
 // ---------- saco de entrenamiento (entrena la fuerza) ----------
 
 void startSack() {
-  if (pet.isEgg() || pet.sleeping || pet.ceremony) return;
+  if (pet.isEgg() || pet.sleeping || pet.ceremony) { sfxPlay(SFX_DENY); return; }
   sackOpen = true;
   sackUntil = millis() + 10000;
   sackOverUntil = 0;
@@ -1130,19 +1209,19 @@ void drawGameScene() {
   else if (hh < 8) { top = C565(0xd1, 0x6a, 0x86); bot = C565(0xf3, 0xb8, 0x7c); }
   else if (hh < 18){ top = C565(0x8f, 0xc8, 0xea); bot = C565(0xdc, 0xee, 0xe6); }
   else             { top = C565(0xc7, 0x5a, 0x4a); bot = C565(0xf0, 0xae, 0x64); }
-  int hor = 376;
+  int hor = 320;
   for (int y = 0; y < hor; y += 8)
-    gfx->fillRect(0, y, 466, 8, lerp565(top, bot, y, hor));
+    gfx->fillRect(0, y, LCD_WIDTH, 8, lerp565(top, bot, y, hor));
   if (night)
     for (auto &st : STARS) gfx->fillRect(st[0], st[1], 4, 4, UI_WHITE);
   uint8_t bio = pet.isEgg() ? 0 : DEX_TBL[pet.speciesId].biome;
   uint16_t soil = BIOME_SOIL[bio < 6 ? bio : 0];
   if (night) soil = lerp565(soil, C565(0x16, 0x1c, 0x30), 9, 16);
-  gfx->fillRect(0, hor, 466, 466 - hor, soil);
+  gfx->fillRect(0, hor, LCD_WIDTH, LCD_HEIGHT - hor, soil);
 }
 
 void renderGame() {
-  // sin fillScreen(NEGRO): drawGameScene cubre los 466x466 completos. Si el
+  // sin fillScreen(NEGRO): drawGameScene cubre todo el framebuffer. Si el
   // DMA del flush anterior aun lee el buffer, vera contenido valido (no negro
   // a medio pintar), que era el parpadeo a 25 fps.
   bool night = sceneHour() < 6 || sceneHour() >= 20;
@@ -1196,8 +1275,8 @@ void renderGame() {
   gfx->setCursor(CX - strlen(rec) * 6, 76);
   gfx->print(rec);
   for (int i = 0; i < 3; i++) {
-    if (i < 3 - gameMisses) gfx->fillCircle(180 + i * 28, 104, 6, UI_BAR_BAD);
-    else gfx->drawCircle(180 + i * 28, 104, 6, UI_TRACK);
+    if (i < 3 - gameMisses) gfx->fillCircle(CX - 28 + i * 28, 104, 6, UI_BAR_BAD);
+    else gfx->drawCircle(CX - 28 + i * 28, 104, 6, UI_TRACK);
   }
 
   if (pmd.loaded) {
@@ -1238,17 +1317,17 @@ void renderGame() {
 void drawCardStat(int y, const char *label, uint16_t val, uint16_t maxBar, uint16_t color) {
   gfx->setTextColor(UI_INK);
   gfx->setTextSize(2);
-  gfx->setCursor(96, y);
+  gfx->setCursor(49, y);
   gfx->print(label);
   char num[8];
   snprintf(num, sizeof(num), "%u", val);
-  gfx->setCursor(330, y);
+  gfx->setCursor(283, y);
   gfx->print(num);
   int bw = 160;
   int fw = (int)val * bw / maxBar;
   if (fw > bw) fw = bw;
-  gfx->fillRoundRect(150, y + 2, bw, 11, 3, UI_TRACK);
-  if (fw > 2) gfx->fillRoundRect(150, y + 2, fw, 11, 3, color);
+  gfx->fillRoundRect(103, y + 2, bw, 11, 3, UI_TRACK);
+  if (fw > 2) gfx->fillRoundRect(103, y + 2, fw, 11, 3, color);
 }
 
 // ---------- ajuste de hora en pantalla (deslizar abajo) ----------
@@ -1271,24 +1350,25 @@ void applyClock() {
 }
 
 void drawClockBtn(int x, int y, const char *l) {
-  gfx->fillRoundRect(x, y, 58, 58, 12, UI_WHITE);
-  gfx->drawRoundRect(x, y, 58, 58, 12, UI_INK);
+  gfx->fillRoundRect(x, y, 64, 64, 12, UI_WHITE);
+  gfx->drawRoundRect(x, y, 64, 64, 12, UI_INK);
   gfx->setTextColor(UI_INK);
   gfx->setTextSize(4);
-  gfx->setCursor(x + 17, y + 15);
+  gfx->setCursor(x + 20, y + 16);
   gfx->print(l);
 }
 
 // pildoras de idioma centradas en y; rellena la activa
-#define LANG_PILL_Y 296
-#define LANG_PILL_H 30
-#define LANG_PILL_X 336          // pildora de idioma (cicla los 6 al tocar)
-#define LANG_PILL_W 96
+#define LANG_PILL_Y 290
+#define LANG_PILL_H 40
+#define LANG_PILL_X 234          // pildora de idioma (cicla los 6 al tocar)
+#define LANG_PILL_W 110
+#define SND_PILL_X 24
+#define SND_PILL_W 110
 static const char *const LANG_CODES[LANG_COUNT] = { "ES", "EN", "FR", "DE", "IT", "PT" };
 
 void renderClock() {
-  gfx->fillScreen(RGB565_BLACK);
-  gfx->fillCircle(CX, CY, 231, UI_BG_DAY);
+  gfx->fillScreen(UI_BG_DAY);
   gfx->setTextColor(UI_INK);
   gfx->setTextSize(3);
   gfx->setCursor(CX - strlen(T(S_SET_TIME)) * 9, 44);
@@ -1300,25 +1380,25 @@ void renderClock() {
   gfx->setCursor(CX - 105, 108);
   gfx->print(t);
 
-  drawClockBtn(104, 190, "-");  // hora -
-  drawClockBtn(170, 190, "+");  // hora +
-  drawClockBtn(252, 190, "-");  // min -
-  drawClockBtn(318, 190, "+");  // min +
+  drawClockBtn(36, 188, "-");   // hora -
+  drawClockBtn(108, 188, "+");  // hora +
+  drawClockBtn(192, 188, "-");  // min -
+  drawClockBtn(264, 188, "+");  // min +
   gfx->setTextSize(2);
   gfx->setTextColor(UI_TRACK);
-  gfx->setCursor(120, 256);
+  gfx->setCursor(104 - (int)strlen(T(S_HOUR)) * 6, 260);
   gfx->print(T(S_HOUR));
-  gfx->setCursor(276, 256);
+  gfx->setCursor(260 - (int)strlen(T(S_MIN)) * 6, 260);
   gfx->print(T(S_MIN));
 
   // interruptor de sonido (izquierda de la fila de idioma)
   bool snd = audioEnabled();
   const char *sl = snd ? T(S_SND_ON) : T(S_SND_OFF);
-  gfx->fillRoundRect(34, LANG_PILL_Y, 96, LANG_PILL_H, 8, snd ? UI_BAR_OK : UI_WHITE);
-  gfx->drawRoundRect(34, LANG_PILL_Y, 96, LANG_PILL_H, 8, UI_INK);
+  gfx->fillRoundRect(SND_PILL_X, LANG_PILL_Y, SND_PILL_W, LANG_PILL_H, 8, snd ? UI_BAR_OK : UI_WHITE);
+  gfx->drawRoundRect(SND_PILL_X, LANG_PILL_Y, SND_PILL_W, LANG_PILL_H, 8, UI_INK);
   gfx->setTextColor(snd ? UI_BG_DAY : UI_INK);
   gfx->setTextSize(2);
-  gfx->setCursor(34 + (96 - (int)strlen(sl) * 12) / 2, LANG_PILL_Y + 8);
+  gfx->setCursor(SND_PILL_X + (SND_PILL_W - (int)strlen(sl) * 12) / 2, LANG_PILL_Y + 12);
   gfx->print(sl);
 
   // selector de idioma: una pildora que cicla los 6 idiomas al tocar
@@ -1328,50 +1408,61 @@ void renderClock() {
   snprintf(lp, sizeof(lp), "%s >", LANG_CODES[gLang]);
   gfx->setTextColor(UI_INK);
   gfx->setTextSize(2);
-  gfx->setCursor(LANG_PILL_X + (LANG_PILL_W - (int)strlen(lp) * 12) / 2, LANG_PILL_Y + 8);
+  gfx->setCursor(LANG_PILL_X + (LANG_PILL_W - (int)strlen(lp) * 12) / 2, LANG_PILL_Y + 12);
   gfx->print(lp);
 
-  gfx->fillRoundRect(133, 340, 200, 48, 14, UI_BAR_OK);
+  gfx->fillRoundRect(CX - 100, 342, 200, 46, 14, UI_BAR_OK);
   gfx->setTextColor(UI_BG_DAY);
   gfx->setTextSize(3);
-  gfx->setCursor(CX - 18, 352);
+  gfx->setCursor(CX - 18, 353);
   gfx->print("OK");
 
   gfx->setTextColor(UI_TRACK);
   gfx->setTextSize(2);
-  gfx->setCursor(CX - strlen(T(S_CLOCK_CANCEL)) * 6, 410);
+  gfx->setCursor(CX - strlen(T(S_CLOCK_CANCEL)) * 6, 406);
   gfx->print(T(S_CLOCK_CANCEL));
 
   // version del firmware (discreta, abajo del todo)
   char ver[20];
   snprintf(ver, sizeof(ver), "TamaPoke v%s", FW_VERSION);
   gfx->setTextSize(1);
-  gfx->setCursor(CX - (int)strlen(ver) * 3, 436);
+  gfx->setCursor(CX - (int)strlen(ver) * 3, 430);
   gfx->print(ver);
   gfx->flush();
 }
 
 void clockTap(int16_t x, int16_t y) {
-  if (y >= 190 && y <= 248) {  // fila de botones +/-
-    if (x >= 104 && x < 162) clockH = (clockH + 23) % 24;
-    else if (x >= 170 && x < 228) clockH = (clockH + 1) % 24;
-    else if (x >= 252 && x < 310) clockM = (clockM + 59) % 60;
-    else if (x >= 318 && x < 376) clockM = (clockM + 1) % 60;
+  // Zonas generosas a proposito: el pulgar cae sistematicamente al lado del
+  // objetivo visual (izquierda en controles de la izquierda, derecha en los de
+  // la derecha, y ~20-40px por debajo por occlusion). Medido en placa.
+  if (y >= 188 && y <= 272) {  // fila de botones +/- (con huecos cubiertos)
+    bool changed = false;
+    if (x >= 30 && x < 180) {
+      if (x < 104) clockH = (clockH + 23) % 24;
+      else clockH = (clockH + 1) % 24;
+      changed = true;
+    } else if (x >= 184 && x < 348) {
+      if (x < 260) clockM = (clockM + 59) % 60;
+      else clockM = (clockM + 1) % 60;
+      changed = true;
+    }
+    if (changed) sfxPlay(SFX_TAP);
     return;
   }
-  if (y >= LANG_PILL_Y && y <= LANG_PILL_Y + LANG_PILL_H) {
-    if (x >= 34 && x < 130) {                  // interruptor de sonido
+  if (y >= 278 && y <= 348) {  // pildoras (visual 290..330 + margen anti-pulgar)
+    if (x >= 16 && x < 140) {  // interruptor de sonido
       audioSetEnabled(!audioEnabled());
-      if (audioEnabled()) sfxPlay(SFX_TAP);    // confirma al encender
+      sfxPlay(SFX_TAP);
       return;
     }
-    if (x >= LANG_PILL_X && x < LANG_PILL_X + LANG_PILL_W) {  // cicla idioma
+    if (x >= 228 && x < 352) {  // cicla idioma
       setLang((Lang)((gLang + 1) % LANG_COUNT));
       sfxPlay(SFX_TAP);
       return;
     }
   }
-  if (y >= 340 && y <= 388 && x >= 133 && x <= 333) { applyClock(); return; }
+  if (y >= 342 && y <= 400 && x >= 80 && x <= 288) { sfxPlay(SFX_TAP); applyClock(); return; }
+  if (y >= 402 && y <= 432 && x >= 94 && x <= 274) { sfxPlay(SFX_TAP); clockOpen = false; }  // cancelar
 }
 
 // llama + numero de racha arriba a la izquierda
@@ -1402,8 +1493,8 @@ void drawCelebration() {
     l2 = buf;
   }
   if (!l1) return;
-  gfx->fillRoundRect(73, 150, 320, 96, 16, UI_BAR_WARN);
-  gfx->drawRoundRect(73, 150, 320, 96, 16, UI_INK);
+  gfx->fillRoundRect(CX - 160, 150, 320, 96, 16, UI_BAR_WARN);
+  gfx->drawRoundRect(CX - 160, 150, 320, 96, 16, UI_INK);
   gfx->setTextColor(UI_INK);
   gfx->setTextSize(3);
   gfx->setCursor(CX - strlen(l1) * 9, 176);
@@ -1431,8 +1522,7 @@ void renderCardProfile() {
   char head[26];
   snprintf(head, sizeof(head), T(S_NAME_FMT), pet.shiny ? "*" : "", nm, pet.level());
   gfx->setTextColor(d.accent);
-  // auto-encoge: a tamano 3 los nombres largos no caben en la franja estrecha de
-  // arriba de la pantalla redonda, asi que se cortaban por el borde
+  // auto-encoge: a tamano 3 los nombres largos no caben en 368px
   int hlen = strlen(head);
   int hts = (hlen <= 11) ? 3 : 2;
   gfx->setTextSize(hts);
@@ -1446,21 +1536,46 @@ void renderCardProfile() {
     gfx->printf("(%s)", sp);
   }
 
-  // retrato grande animado
-  if (pmd.loaded) drawPmdAct(PMD_IDLE, CX, 206, millis(), true, false, 4);
+  // retrato grande animado (PMD de la SD; si no hay, sprite de flash)
+  if (pmd.loaded) {
+    drawPmdAct(PMD_IDLE, CX, 206, millis(), true, false, 4);
+  } else {
+    int fi = flashIdxForDex(pet.speciesId);
+    if (fi >= 0) {
+      const Species &sp = SPECIES[fi];
+      int s = sp.scale;
+      int y0 = 126 - 16 * s;
+      while (y0 < 66 && s > 2) { s--; y0 = 126 - 16 * s; }  // no tapar el titulo
+      int x0 = CX - 16 * s;
+      drawMap(sp.sprite, SPRITE_H, x0, y0, s, false);
+      if ((millis() % 3500) < 300) {  // parpadeo como en la pantalla principal
+        overlayEye(sp, x0, y0, s, sp.eyeColL);
+        overlayEye(sp, x0, y0, s, sp.eyeColR);
+      }
+    } else {
+      gfx->setTextColor(UI_INK);
+      gfx->setTextSize(6);
+      gfx->setCursor(CX - 18, 110);
+      gfx->print("?");
+      gfx->setTextSize(2);
+      gfx->setCursor(CX - (int)strlen(T(S_NO_SPRITES)) * 6, 170);
+      gfx->print(T(S_NO_SPRITES));
+    }
+  }
 
-  // racha con llama
-  int sx = 138, sy = 224;
-  gfx->fillTriangle(sx + 8, sy, sx + 1, sy + 18, sx + 15, sy + 18, UI_BAR_BAD);
-  gfx->fillTriangle(sx + 8, sy + 7, sx + 4, sy + 18, sx + 12, sy + 18, UI_BAR_WARN);
+  // racha con llama, centrada como unidad (ancho medido)
   char rl[30];
   snprintf(rl, sizeof(rl), T(S_STREAK_FMT), pet.streak, pet.bestStreak);
+  int rlen = strlen(rl);
+  int sx = CX - (16 + 8 + rlen * 12) / 2, sy = 228;
+  gfx->fillTriangle(sx + 8, sy, sx + 1, sy + 18, sx + 15, sy + 18, UI_BAR_BAD);
+  gfx->fillTriangle(sx + 8, sy + 7, sx + 4, sy + 18, sx + 12, sy + 18, UI_BAR_WARN);
   gfx->setTextColor(UI_INK);
   gfx->setTextSize(2);
   gfx->setCursor(sx + 24, sy + 2);
   gfx->print(rl);
 
-  drawCardStat(258, T(S_VIN), pet.bond, 100, C565(0xd4, 0x52, 0x7e));
+  drawCardStat(262, T(S_VIN), pet.bond, 100, C565(0xd4, 0x52, 0x7e));
 
   const char *berry = !pet.berryKnown ? T(S_BERRY_UNK)
                       : pet.lovesBerry(0) ? T(S_BERRY_RED)
@@ -1471,11 +1586,11 @@ void renderCardProfile() {
            (unsigned long)(pet.ageMinutes / 1440));
   gfx->setTextColor(UI_INK);
   gfx->setTextSize(2);
-  gfx->setCursor(CX - strlen(info) * 6, 296);
+  gfx->setCursor(CX - strlen(info) * 6, 300);
   gfx->print(info);
 
   gfx->setTextColor(UI_TRACK);
-  gfx->setCursor(CX - strlen(T(S_RENAME_HINT)) * 6, 332);
+  gfx->setCursor(CX - strlen(T(S_RENAME_HINT)) * 6, 334);
   gfx->print(T(S_RENAME_HINT));
 }
 
@@ -1492,10 +1607,10 @@ void renderCardStats() {
   drawCardStat(244, T(S_STAT_WGT), pet.weight, 100, 0xB3C8);
 
   // boton: saco de entrenamiento de fuerza
-  gfx->fillRoundRect(96, 300, 274, 40, 12, UI_BAR_BAD);
+  gfx->fillRoundRect(47, 296, 274, 48, 12, UI_BAR_BAD);
   gfx->setTextColor(UI_BG_DAY);
   gfx->setTextSize(2);
-  gfx->setCursor(CX - strlen(T(S_TRAIN_STR)) * 6, 311);
+  gfx->setCursor(CX - strlen(T(S_TRAIN_STR)) * 6, 313);
   gfx->print(T(S_TRAIN_STR));
 }
 
@@ -1512,9 +1627,9 @@ void renderCardMedals() {
   gfx->print(head);
 
   for (int i = 0; i < MED_COUNT; i++) {
-    int x = 28 + (i % 2) * 206, y = 104 + (i / 2) * 54;
+    int x = 20 + (i % 2) * 170, y = 104 + (i / 2) * 54;
     bool g = pet.hasMedal(1 << i);
-    gfx->fillRoundRect(x, y, 196, 44, 10, g ? UI_BAR_OK : UI_TRACK);
+    gfx->fillRoundRect(x, y, 160, 44, 10, g ? UI_BAR_OK : UI_TRACK);
     if (g) {  // marca de conseguida
       gfx->fillCircle(x + 22, y + 22, 11, UI_BG_DAY);
       gfx->setTextColor(UI_BAR_OK);
@@ -1522,10 +1637,42 @@ void renderCardMedals() {
       gfx->setCursor(x + 16, y + 13);
       gfx->print("v");
     }
+    // Etiqueta en 1 linea a tamano 2 si cabe (<=9 caracteres); si no, en 2
+    // lineas cortadas por el espacio central ("SERIE 7"/"GIORNI"): todas las
+    // mitades en los 6 idiomas miden <=9. Ultimo recurso: tamano 1.
+    const char *md = medalDesc(i);
+    int mlen = strlen(md);
     gfx->setTextColor(g ? UI_BG_DAY : 0x8410);
-    gfx->setTextSize(2);
-    gfx->setCursor(x + 44, y + 14);
-    gfx->print(medalDesc(i));
+    if (mlen <= 9) {
+      gfx->setTextSize(2);
+      gfx->setCursor(x + 40 + (116 - mlen * 12) / 2, y + 14);
+      gfx->print(md);
+    } else {
+      int best = -1;
+      for (int k = 0; k < mlen; k++)
+        if (md[k] == ' ' && (best < 0 || abs(k - mlen / 2) < abs(best - mlen / 2))) best = k;
+      char l1[20], l2[20];
+      int n1 = 99, n2 = 99;
+      if (best > 0 && best < mlen - 1) {
+        memcpy(l1, md, best);
+        l1[best] = 0;
+        strncpy(l2, md + best + 1, sizeof(l2) - 1);
+        l2[sizeof(l2) - 1] = 0;
+        n1 = strlen(l1);
+        n2 = strlen(l2);
+      }
+      if (n1 <= 9 && n2 <= 9) {
+        gfx->setTextSize(2);
+        gfx->setCursor(x + 40 + (116 - n1 * 12) / 2, y + 6);
+        gfx->print(l1);
+        gfx->setCursor(x + 40 + (116 - n2 * 12) / 2, y + 22);
+        gfx->print(l2);
+      } else {  // sin espacio util: encoger (no deberia pasar con estos textos)
+        gfx->setTextSize(1);
+        gfx->setCursor(x + 40 + (116 - mlen * 6) / 2, y + 18);
+        gfx->print(md);
+      }
+    }
   }
 }
 
@@ -1547,7 +1694,7 @@ void renderCardProgress() {
 
   // barra de progreso al siguiente nivel (1 nivel = 60 min de juego)
   uint8_t into = pet.ageMinutes % MINUTES_PER_LEVEL;
-  int bx = 93, bw = 280, by = 158, bh = 22;
+  int bx = 44, bw = 280, by = 158, bh = 22;
   gfx->fillRoundRect(bx, by, bw, bh, 6, UI_TRACK);
   int fw = (bw - 4) * into / MINUTES_PER_LEVEL;
   if (fw > 0) gfx->fillRoundRect(bx + 2, by + 2, fw, bh - 4, 5, UI_BAR_OK);
@@ -1590,8 +1737,7 @@ void renderCardProgress() {
 }
 
 void renderCard() {
-  gfx->fillScreen(RGB565_BLACK);
-  gfx->fillCircle(CX, CY, 231, UI_BG_DAY);
+  gfx->fillScreen(UI_BG_DAY);
   if (cardPage == 0) renderCardProfile();
   else if (cardPage == 1) renderCardStats();
   else if (cardPage == 2) renderCardMedals();
@@ -1599,12 +1745,12 @@ void renderCard() {
 
   // indicador de 4 paginas + ayuda
   for (int i = 0; i < 4; i++) {
-    if (i == cardPage) gfx->fillCircle(194 + i * 26, 374, 5, UI_INK);
-    else gfx->drawCircle(194 + i * 26, 374, 4, UI_INK);
+    if (i == cardPage) gfx->fillCircle(CX - 39 + i * 26, 400, 5, UI_INK);
+    else gfx->drawCircle(CX - 39 + i * 26, 400, 4, UI_INK);
   }
   gfx->setTextColor(UI_TRACK);
   gfx->setTextSize(2);
-  gfx->setCursor(CX - strlen(T(S_BACK)) * 6, 398);
+  gfx->setCursor(CX - strlen(T(S_BACK)) * 6, 420);
   gfx->print(T(S_BACK));
   gfx->flush();
 }
@@ -1613,10 +1759,12 @@ void renderCard() {
 
 static const char KB_KEYS[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ.-";  // 28 + DEL + OK = 30
 #define KB_COLS 6
-#define KB_X 40
-#define KB_Y 150
-#define KB_W 64
-#define KB_H 52
+#define KB_X 14
+#define KB_Y 148
+#define KB_W 56
+#define KB_H 54
+int kbFlash = -1;          // ultima tecla (destello visual de confirmacion)
+uint32_t kbFlashT = 0;
 
 void openKeyboard() {
   kbOpen = true;
@@ -1626,25 +1774,25 @@ void openKeyboard() {
 }
 
 void renderKeyboard() {
-  gfx->fillScreen(RGB565_BLACK);
-  gfx->fillCircle(CX, CY, 231, UI_BG_DAY);
+  gfx->fillScreen(UI_BG_DAY);
   gfx->setTextColor(UI_INK);
   gfx->setTextSize(2);
   gfx->setCursor(CX - strlen(T(S_NAME)) * 6, 56);
   gfx->print(T(S_NAME));
   // buffer actual
-  gfx->fillRoundRect(83, 84, 300, 40, 8, UI_WHITE);
-  gfx->drawRoundRect(83, 84, 300, 40, 8, UI_INK);
+  gfx->fillRoundRect(34, 84, 300, 40, 8, UI_WHITE);
+  gfx->drawRoundRect(34, 84, 300, 40, 8, UI_INK);
   gfx->setTextSize(3);
-  gfx->setCursor(95, 94);
+  gfx->setCursor(46, 94);
   gfx->print(nameLen ? nameBuf : "_");
 
   for (int i = 0; i < 30; i++) {
     int x = KB_X + (i % KB_COLS) * KB_W, y = KB_Y + (i / KB_COLS) * KB_H;
     bool special = (i >= 28);
-    gfx->fillRoundRect(x, y, KB_W - 6, KB_H - 6, 6, special ? UI_BAR_WARN : UI_WHITE);
+    bool flash = (i == kbFlash && millis() - kbFlashT < 200);  // confirma la pulsacion
+    gfx->fillRoundRect(x, y, KB_W - 6, KB_H - 6, 6, flash ? UI_BAR_OK : (special ? UI_BAR_WARN : UI_WHITE));
     gfx->drawRoundRect(x, y, KB_W - 6, KB_H - 6, 6, UI_INK);
-    gfx->setTextColor(UI_INK);
+    gfx->setTextColor(flash ? UI_WHITE : UI_INK);
     gfx->setTextSize(2);
     if (i < 28) {
       gfx->setCursor(x + KB_W / 2 - 9, y + KB_H / 2 - 10);
@@ -1659,10 +1807,18 @@ void renderKeyboard() {
 }
 
 void keyboardTap(int16_t x, int16_t y) {
+  // Fuera de la rejilla se ignora; dentro, se sujeta a la tecla mas cercana
+  // (el pulgar cae hasta ~20px fuera del borde y antes se perdia).
+  if (x < 0 || x >= LCD_WIDTH || y < 140 || y >= LCD_HEIGHT) return;
   int col = (x - KB_X) / KB_W, row = (y - KB_Y) / KB_H;
-  if (col < 0 || col >= KB_COLS || row < 0 || row >= 5) return;
+  if (col < 0) col = 0;
+  if (col >= KB_COLS) col = KB_COLS - 1;
+  if (row < 0) row = 0;
+  if (row > 4) row = 4;
   int i = row * KB_COLS + col;
-  if (i >= 30) return;
+  kbFlash = i;
+  kbFlashT = millis();
+  sfxPlay(SFX_TAP);  // el teclado era mudo: ahora cada tecla confirma
   if (i == 28) {  // borrar
     if (nameLen) nameBuf[--nameLen] = 0;
   } else if (i == 29) {  // OK
@@ -1676,9 +1832,9 @@ void keyboardTap(int16_t x, int16_t y) {
 
 // ---------- galeria pokedex ----------
 
-#define GAL_X 73
+#define GAL_X 40
 #define GAL_Y 84
-#define GAL_CELL 80
+#define GAL_CELL 72
 
 // dibuja una miniatura centrada en su celda; sil=true la pinta en tinta
 void drawThumb(const uint8_t *b, int x, int y, int s, bool sil) {
@@ -1699,8 +1855,7 @@ void drawThumb(const uint8_t *b, int x, int y, int s, bool sil) {
 
 void renderGallery() {
   if (galleryDetail) {  // vista detalle: se redibuja siempre (animada)
-    gfx->fillScreen(RGB565_BLACK);
-    gfx->fillCircle(CX, CY, 231, UI_BG_DAY);
+    gfx->fillScreen(UI_BG_DAY);
     const DexEntry &d = DEX_TBL[galleryDetail];
     bool reg = pet.isRegistered(galleryDetail);
     char head[24];
@@ -1721,7 +1876,7 @@ void renderGallery() {
     }
     gfx->setTextColor(UI_INK);
     gfx->setTextSize(2);
-    gfx->setCursor(CX - strlen(T(S_DETAIL_BACK)) * 6, 408);
+    gfx->setCursor(CX - strlen(T(S_DETAIL_BACK)) * 6, 424);
     gfx->print(T(S_DETAIL_BACK));
     gfx->flush();
     return;
@@ -1730,8 +1885,7 @@ void renderGallery() {
   if (!galleryDirty) return;  // la rejilla es estatica
   galleryDirty = false;
 
-  gfx->fillScreen(RGB565_BLACK);
-  gfx->fillCircle(CX, CY, 231, UI_BG_DAY);
+  gfx->fillScreen(UI_BG_DAY);
   char head[24];
   snprintf(head, sizeof(head), T(S_POKEDEX_FMT), pet.registeredCount());
   gfx->setTextColor(UI_INK);
@@ -1765,8 +1919,8 @@ void renderGallery() {
   }
   // puntos de pagina
   for (int i = 0; i < 10; i++) {
-    if (i == galleryPage) gfx->fillCircle(170 + i * 14, 436, 4, UI_INK);
-    else gfx->drawCircle(170 + i * 14, 436, 3, UI_INK);
+    if (i == galleryPage) gfx->fillCircle(CX - 63 + i * 14, 420, 4, UI_INK);
+    else gfx->drawCircle(CX - 63 + i * 14, 420, 3, UI_INK);
   }
   gfx->flush();
 }
@@ -1839,8 +1993,8 @@ void drawCeremony() {
   if (panic) {
     // final triste: penumbra azulada + lluvia
     for (int i = 0; i < 46; i++) {
-      int rx = (i * 47 + now / 3) % 466;
-      int ry = (i * 91 + now / 2) % 470;
+      int rx = (i * 47 + now / 3) % LCD_WIDTH;
+      int ry = (i * 91 + now / 2) % (LCD_HEIGHT + 22);
       gfx->drawLine(rx, ry, rx - 3, ry + 12, C565(0x6a, 0x84, 0xb0));
     }
     bool fade = false;
@@ -1868,7 +2022,7 @@ void drawCeremony() {
     gfx->drawCircle(CX, gcy, r, C565(0xff, 0xdf, 0x8a));
   }
   for (int i = 0; i < 16; i++) {
-    int px = (i * 71 + 28) % 466;
+    int px = (i * 71 + 28) % LCD_WIDTH;
     int py = 410 - (int)((now / 8 + i * 70) % 360);   // suben y reaparecen abajo
     if (py < 30) continue;
     if (i % 4 == 0) drawMap(SPR_HEART, 32, px - 8, py - 8, 1, false);  // corazoncito
@@ -1897,17 +2051,17 @@ void drawChoiceDialog() {
     q = T(S_FAR_Q); o1 = T(S_FAR_GO); o2 = T(S_FAR_STAY);
     c1 = UI_BAR_WARN; t1 = UI_INK; c2 = UI_BAR_OK; t2 = UI_WHITE;
   }
-  gfx->fillRoundRect(73, 156, 320, 188, 16, UI_WHITE);
-  gfx->drawRoundRect(73, 156, 320, 188, 16, UI_INK);
+  gfx->fillRoundRect(CX - 160, 156, 320, 188, 16, UI_WHITE);
+  gfx->drawRoundRect(CX - 160, 156, 320, 188, 16, UI_INK);
   gfx->setTextColor(UI_INK);
   gfx->setTextSize(2);
   gfx->setCursor(CX - (int)strlen(q) * 6, 176);
   gfx->print(q);
-  gfx->fillRoundRect(93, 206, 280, 52, 12, c1);     // boton accion
+  gfx->fillRoundRect(CX - 140, 206, 280, 52, 12, c1);     // boton accion
   gfx->setTextColor(t1);
   gfx->setCursor(CX - (int)strlen(o1) * 6, 224);
   gfx->print(o1);
-  gfx->fillRoundRect(93, 268, 280, 52, 12, c2);     // boton mantener/quedaros
+  gfx->fillRoundRect(CX - 140, 268, 280, 52, 12, c2);     // boton mantener/quedaros
   gfx->setTextColor(t2);
   gfx->setCursor(CX - (int)strlen(o2) * 6, 286);
   gfx->print(o2);
@@ -2059,7 +2213,8 @@ void drawPet() {
 // ---------- escena de bano ----------
 
 void startBath() {
-  if (pet.isEgg() || pet.sleeping || pet.ceremony || bathUntil) return;
+  if (bathUntil) return;  // ya en el bano: el toque se ignora en silencio
+  if (pet.isEgg() || pet.sleeping || pet.ceremony) { sfxPlay(SFX_DENY); return; }
   bathUntil = millis() + 3000;
   bathPending = true;
   int cx = (int)beh.x;
@@ -2166,7 +2321,7 @@ void behNext() {
   int r = random(100);
   if (r < 35 && (pmd.has(PMD_WALKL) || pmd.has(PMD_WALKR))) {
     beh.mode = 1;  // paseo
-    beh.targetX = 150 + random(176);
+    beh.targetX = CX - 88 + random(176);
     beh.until = now + 15000;
   } else if (r < 60) {
     // gesto aleatorio entre los disponibles
@@ -2289,10 +2444,10 @@ void drawPoops() {
 }
 
 void drawBars() {
-  drawBar(78, 318, T(S_BAR_FOOD), pet.fullness);
-  drawBar(244, 318, T(S_BAR_JOY), pet.joy);
-  drawBar(78, 346, T(S_BAR_ENE), pet.energy);
-  drawBar(244, 346, T(S_BAR_HYG), pet.hygiene);
+  drawBar(20, 310, T(S_BAR_FOOD), pet.fullness);
+  drawBar(192, 310, T(S_BAR_JOY), pet.joy);
+  drawBar(20, 338, T(S_BAR_ENE), pet.energy);
+  drawBar(192, 338, T(S_BAR_HYG), pet.hygiene);
 }
 
 void drawBar(int x, int y, const char *label, uint8_t val) {

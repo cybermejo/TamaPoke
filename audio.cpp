@@ -36,41 +36,42 @@ static uint8_t esR(uint8_t reg) {
   return Wire.available() ? Wire.read() : 0;
 }
 
-// Secuencia de init VERIFICADA EN ESTA PLACA (proyecto PlaneRadar2.0, misma
-// Waveshare 1.75). Clave: reloj DERIVADO DEL BCLK (reg01=0xBF, sin MCLK externo)
-// y referencia interna que alimenta el DAC (reg44=0x58); sin esos dos el codec
-// respondia por I2C pero no salia audio. 16kHz, 16-bit, esclavo I2S.
+// Secuencia de init igual que el driver oficial (esp-bsp / ejemplo 15_ES8311
+// de la Waveshare 1.8, validado en esta placa): reloj desde el pin MCLK
+// (16kHz*256 = 4.096MHz, generado por el I2S), 16kHz, 16-bit, esclavo I2S.
+// El init anterior (reloj derivado del BCLK, heredado de la 1.75) hacia ACK
+// pero no sacaba audio en la 1.8 (divisores pensados para otro MCLK).
 static bool es8311Init() {
   Wire.beginTransmission(ES8311_ADDR);
   if (Wire.endTransmission() != 0) return false;
 
-  // open()
-  esW(0x0D, 0xFA); esW(0x44, 0x08); esW(0x44, 0x08);  // power up + quirk de 1a escritura
-  esW(0x01, 0x30); esW(0x02, 0x00); esW(0x03, 0x10); esW(0x16, 0x24);
-  esW(0x04, 0x10); esW(0x05, 0x00); esW(0x0B, 0x00); esW(0x0C, 0x00);
-  esW(0x10, 0x1F); esW(0x11, 0x7F);
-  esW(0x00, 0x80); esW(0x00, 0x80);                   // reset clock, esclavo
-  esW(0x01, 0xBF);                                    // clk src = BCLK (sin MCLK externo)
-  { uint8_t r = esR(0x06); r &= ~0x20; esW(0x06, r); }  // SCLK no invertido
-  esW(0x13, 0x10); esW(0x1B, 0x0A); esW(0x1C, 0x6A);
-  esW(0x44, 0x58);                                    // referencia interna -> alimenta el DAC
+  // reset + power-on
+  esW(0x00, 0x1F); esW(0x00, 0x00); esW(0x00, 0x80);
 
-  // config_sample(): BCLK*8 = DIG_MCLK
-  esW(0x02, 0x18); esW(0x05, 0x00); esW(0x03, 0x10); esW(0x04, 0x20);
+  // fuente de reloj: pin MCLK, todos los relojes on, sin invertir
+  esW(0x01, 0x3F);
+  { uint8_t r = esR(0x06); r &= ~0x20; esW(0x06, r); }  // SCLK no invertido
+
+  // divisores para MCLK=4.096MHz, fs=16kHz (fila {4096000,16000} de coeff_div)
+  { uint8_t r = esR(0x02); r &= 0x07; esW(0x02, r); }
+  esW(0x03, 0x10); esW(0x04, 0x10); esW(0x05, 0x00);
+  { uint8_t r = esR(0x06); r &= 0xE0; r |= 0x03; esW(0x06, r); }  // bclk_div=4
   { uint8_t r = esR(0x07); r &= 0xC0; esW(0x07, r); }
   esW(0x08, 0xFF);
-  { uint8_t r = esR(0x06); r &= 0xE0; r |= 0x03; esW(0x06, r); }  // bclk_div=4
 
-  // formato I2S 16-bit
+  // formato: esclavo, I2S 16-bit
+  { uint8_t r = esR(0x00); r &= 0xBF; esW(0x00, r); }
   esW(0x09, 0x0C); esW(0x0A, 0x0C);
 
-  // start() DAC esclavo
-  esW(0x00, 0x80); esW(0x01, 0xBF); esW(0x09, 0x0C); esW(0x0A, 0x0C);
-  esW(0x17, 0xBF); esW(0x0E, 0x02); esW(0x12, 0x00); esW(0x14, 0x1A);
-  esW(0x0D, 0x01); esW(0x15, 0x40); esW(0x37, 0x08); esW(0x45, 0x00);
+  // encendido: analogico + PGA/ADC + DAC + salida HP (al amplificador)
+  esW(0x0D, 0x01); esW(0x0E, 0x02); esW(0x12, 0x00); esW(0x13, 0x10);
+  esW(0x1C, 0x6A); esW(0x37, 0x08);
 
-  // volumen + unmute
-  esW(0x32, 0xBF);                                    // volumen DAC ~0 dB
+  // micro analogico (igual que el ejemplo; no se usa para jugar)
+  esW(0x17, 0xC8); esW(0x14, 0x1A);
+
+  // volumen voz 85 (85*256/100-1 = 216) + unmute
+  esW(0x32, 216);
   { uint8_t r = esR(0x31); r &= 0x9F; esW(0x31, r); }  // unmute
   return true;
 }
@@ -101,7 +102,8 @@ static int16_t buf[256 * 2];  // estéreo intercalado (L=R)
 static void playTone(uint16_t f, uint16_t ms) {
   int total = SAMPLE_RATE * ms / 1000;
   int half = f ? (SAMPLE_RATE / (2 * f)) : 0;  // medio periodo en muestras
-  const int16_t amp = 5000;
+  const int16_t amp = 20000;  // bien audible en el altavoz integrado (el tono
+                              // de prueba a 30000 se oye perfecto en placa)
   int phase = 0, done = 0;
   bool high = true;
   while (done < total) {
@@ -126,12 +128,8 @@ static void audioTask(void *) {
   uint8_t id;
   for (;;) {
     if (xQueueReceive(gQ, &id, portMAX_DELAY) && gOn && gReady && id < SFX_COUNT) {
-      digitalWrite(PA, HIGH);  // enciende el amplificador
-      delay(8);                // deja que arranque
       const SfxDef &d = SFX[id];
       for (uint8_t i = 0; i < d.len; i++) playTone(d.n[i].f, d.n[i].ms);
-      delay(60);               // deja salir la cola del DMA antes de cortar
-      digitalWrite(PA, LOW);   // apaga el amp entre sonidos (evita siseo)
     }
   }
 }
@@ -139,7 +137,7 @@ static void audioTask(void *) {
 void audioBegin() {
   // I2S primero: arranca el MCLK que necesita el códec para engancharse
   pinMode(PA, OUTPUT);
-  digitalWrite(PA, LOW);   // amp apagado; la tarea lo enciende al reproducir
+  digitalWrite(PA, HIGH);  // amp siempre on, como el ejemplo oficial 15_ES8311
 
   i2s.setPins(I2S_BCK_IO, I2S_WS_IO, I2S_DO_IO, I2S_DI_IO, I2S_MCK_IO);
   if (!i2s.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT,

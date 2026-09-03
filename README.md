@@ -2,15 +2,15 @@
 
 [![Flash in browser](https://img.shields.io/badge/flash-in%20browser-FF6B00?logo=googlechrome&logoColor=white)](https://socquique.github.io/TamaPoke/web/)
 [![MakerWorld](https://img.shields.io/badge/MakerWorld-3D%20case-00AE42?logo=bambulab&logoColor=white)](https://makerworld.com/es/models/2937822-tamapoke-a-pokemon-pokeball-tamagotchi)
-![Board](https://img.shields.io/badge/board-ESP32--S3%20round%20AMOLED-E7352C?logo=espressif&logoColor=white)
-![Firmware](https://img.shields.io/badge/firmware-v1.2-8A2BE2)
+![Board](https://img.shields.io/badge/board-ESP32--S3--Touch--AMOLED--1.8-E7352C?logo=espressif&logoColor=white)
+![Firmware](https://img.shields.io/badge/firmware-v2.0-8A2BE2)
 ![Code](https://img.shields.io/badge/code-MIT-blue)
 ![Languages](https://img.shields.io/badge/languages-6-FFCB05)
 [![Stars](https://img.shields.io/github/stars/socquique/TamaPoke?style=flat&logo=github&color=yellow)](https://github.com/socquique/TamaPoke/stargazers)
 
 A gen-1-Pokémon-inspired tamagotchi for the
-**Waveshare ESP32-S3-Touch-AMOLED-1.75** (round 466×466 AMOLED, CO5300 driver
-over QSPI, CST9217 touch over I2C). Raise any of the 151, evolve it, train it
+**Waveshare ESP32-S3-Touch-AMOLED-1.8** (368×448 AMOLED, CO5300 driver on V2 /
+SH8601 on V1 over QSPI, CST820 / FT3168 touch over I2C). Raise any of the 151, evolve it, train it
 and complete them all (shinies included).
 
 > **Personal, non-commercial fan project.** Code is MIT; the sprites are from
@@ -122,29 +122,38 @@ SPEED ← minigame, DEFENSE ← 12 h of unbroken good care). *(Battles: on the r
 
 ## Hardware
 
-- Board: [ESP32-S3-Touch-AMOLED-1.75](https://www.waveshare.com/wiki/ESP32-S3-Touch-AMOLED-1.75)
-  — get the **Standard** (no case) or **-G** (GPS, also fits) version; **not the "-B"**
-  (ships with a protective case that won't fit). The separate "1.75**C**" is a different board.
-- Round 466×466 AMOLED, **CO5300** driver (QSPI, 80 MHz)
-- Capacitive touch **CST9217** (I2C, address 0x5A)
+- Board: [ESP32-S3-Touch-AMOLED-1.8](https://www.waveshare.com/wiki/ESP32-S3-Touch-AMOLED-1.8).
+  Two revisions share pins and differ only in display/touch driver, which the
+  firmware **auto-detects at boot** by probing the touch I2C address
+  (0x15 = **V2 = CO5300 + CST820**, the one shipping since 05/2026;
+  0x38 = **V1 = SH8601 + FT3168**).
+- 368×448 portrait AMOLED over QSPI
+- Capacitive touch (I2C): **CST820** (V2) / **FT3168** (V1)
 - **AXP2101** (power management + battery + PWR button), **PCF85063** (RTC),
-  microSD slot, **ES8311** audio codec (→ amplifier → external speaker on the
-  MX1.25 connector)
-- Pins taken from the [official Waveshare repo](https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-1.75) (see `pin_config.h`)
+  microSD slot, **ES8311** audio codec (→ amplifier → onboard speaker),
+  **XCA9554** GPIO expander (display/touch reset + SD power)
+- Pins taken from the [official Waveshare repo](https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-1.8) (see `pin_config.h`)
 
 ## Libraries (Arduino IDE / arduino-cli)
 
 | Library | Author | Use |
 |---|---|---|
-| GFX Library for Arduino (`Arduino_GFX`) | moononournation | CO5300 over QSPI + framebuffer in PSRAM |
-| SensorLib | Lewis He | CST9217 touch + PCF85063 RTC |
+| GFX Library for Arduino (`Arduino_GFX`) | moononournation | CO5300/SH8601 over QSPI + framebuffer in PSRAM |
+| Arduino_DriveBus (bundled in the Waveshare 1.8 repo) | Waveshare | CST820 / FT3168 touch |
+| Adafruit_XCA9554 | Adafruit | GPIO expander (display/touch reset, SD power) |
+| SensorLib | Lewis He | PCF85063 RTC |
 | XPowersLib | Lewis He | AXP2101 PMU (battery, brightness, PWR button) |
 | ESP_I2S (bundled in the ESP32 core) | Espressif | I2S to the ES8311 codec |
+
+> `Arduino_DriveBus` is not in the Library Manager: copy
+> `examples/arduino-v2/libraries/Arduino_DriveBus` from the
+> [official Waveshare 1.8 repo](https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-1.8)
+> into your Arduino libraries folder (`~/Documents/Arduino/libraries`).
 
 ## IDE setup / build
 
 - Board: **ESP32S3 Dev Module** · Flash **16MB** · PSRAM **OPI PSRAM**
-  (required: the 466×466×16-bit framebuffer ≈ 434 KB lives in PSRAM) ·
+  (required: the 368×448×16-bit framebuffer ≈ 330 KB lives in PSRAM) ·
   Partition Scheme with FAT (e.g. `16M Flash (3MB APP/9MB FATFS)`) ·
   USB CDC On Boot **Enabled**
 
